@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"odoo_method_analyzer/internal/model"
 	"odoo_method_analyzer/internal/ui"
@@ -15,6 +16,7 @@ func Print(printer *ui.Printer, root string, result model.Result) {
 	fmt.Println()
 	fmt.Printf("Used methods: %d\n", len(result.UsedMethods))
 	fmt.Printf("Unused methods: %d\n", len(result.UnusedMethods))
+	fmt.Printf("Route methods: %d\n", len(result.RouteMethods))
 	fmt.Printf("Orphaned super() calls: %d\n", len(result.OrphanedSuperCalls))
 
 	if len(result.OrphanedSuperCalls) > 0 {
@@ -34,6 +36,26 @@ func Print(printer *ui.Printer, root string, result model.Result) {
 				overrideMarker = " [OVERRIDE]"
 			}
 			fmt.Printf("  - %s in %s%s (%s:%d)\n", method.Name, method.ClassName, overrideMarker, relativePath(root, method.FilePath), method.LineNumber)
+		}
+	}
+
+	if len(result.RouteMethods) > 0 {
+		fmt.Println()
+		fmt.Println(printer.RouteColor("Route methods (HTTP controllers — called via URL, not code):"))
+		fmt.Println(printer.YellowColor("  These may appear unused but are triggered by HTTP requests. Review before removing."))
+		for _, method := range result.RouteMethods {
+			routes := ""
+			if len(method.Routes) > 0 {
+				routes = "  →  " + strings.Join(method.Routes, "  |  ")
+			}
+			fmt.Printf("  %s  %s in %s (%s:%d)%s\n",
+				printer.RouteColor("[ROUTE]"),
+				method.Name,
+				method.ClassName,
+				relativePath(root, method.FilePath),
+				method.LineNumber,
+				printer.RouteColor(routes),
+			)
 		}
 	}
 

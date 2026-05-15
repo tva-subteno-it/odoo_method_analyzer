@@ -20,7 +20,8 @@ const maxFileSize = 1 << 20
 var (
 	classRe          = regexp.MustCompile(`^class\s+([A-Za-z_][A-Za-z0-9_]*)`)
 	defRe            = regexp.MustCompile(`^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-	routeDecoratorRe = regexp.MustCompile(`@http\.route`)
+	routeDecoratorRe = regexp.MustCompile(`@(?:http\.)?route\b`)
+	routeStringRe    = regexp.MustCompile(`['"](\/[^'"]*)['"]`)
 	apiDecoratorRe   = regexp.MustCompile(`@api\.(onchange|constrains|depends)`)
 	superCallRe      = regexp.MustCompile(`super\(\s*[^)]*\)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*[\(\.]`)
 	dynamicPercentRe = regexp.MustCompile(`getattr\s*\(\s*[^,]+,\s*['"]([A-Za-z_][A-Za-z0-9_]*)%s['"]`)
@@ -39,6 +40,47 @@ type dynamicPrefix struct {
 	Prefix   string
 	FilePath string
 	Line     int
+}
+
+// langPattern holds a compiled regex check for a single usage pattern.
+type langPattern struct {
+	reason  string
+	re      *regexp.Regexp
+	skipDef bool // skip the method's own definition line (Python only)
+}
+
+// methodPatterns caches all compiled regex patterns for one method name.
+// Build it once per method via buildMethodPatterns and reuse across all files.
+type methodPatterns struct {
+	python []langPattern
+	js     []langPattern
+	xml    []langPattern
+}
+
+// buildMethodPatterns compiles every regex needed to search for methodName
+// across Python, JavaScript and XML files. Call once per method, not per file.
+func buildMethodPatterns(methodName string) methodPatterns {
+	q := regexp.QuoteMeta(methodName)
+	return methodPatterns{
+		python: []langPattern{
+			{reason: "method_call", re: regexp.MustCompile(`\.` + q + `\s*\(`), skipDef: true},
+			{reason: "method_assignment", re: regexp.MustCompile(`=.*\.` + q + `\s*($|[^\w(])`), skipDef: true},
+			{reason: "direct_function_call", re: regexp.MustCompile(`\b` + q + `\s*\(`), skipDef: true},
+			{reason: "string_reference", re: regexp.MustCompile(`(compute|inverse|search|default|onchange|constraint|depends)\s*=\s*['"]_?` + q + `['"]`)},
+			{reason: "decorator_reference", re: regexp.MustCompile(`@api\.(depends|constrains|onchange)\s*\([^)]*['"]_?` + q + `['"]`)},
+			{reason: "search_attribute", re: regexp.MustCompile(`search\s*=\s*['"]` + q + `['"]`)},
+			{reason: "general_string_reference", re: regexp.MustCompile(`['"]_?` + q + `['"]`)},
+			{reason: "default_assignment", re: regexp.MustCompile(`default\s*=\s*` + q + `\b`)},
+		},
+		js: []langPattern{
+			{reason: "direct_call", re: regexp.MustCompile(`(?:\.|\b)` + q + `\s*(?:\(|:)`)},
+			{reason: "string_reference", re: regexp.MustCompile(`["']` + q + `["']`)},
+		},
+		xml: []langPattern{
+			{reason: "attribute_reference", re: regexp.MustCompile(`(name|string|context|attrs|invisible|readonly|required|domain)\s*=\s*["'][^"']*\b` + q + `\b`)},
+			{reason: "text_reference", re: regexp.MustCompile(`\b` + q + `\b`)},
+		},
+	}
 }
 
 func Run(ctx context.Context, cfg model.Config, paths model.ProjectPaths, printer *ui.Printer) (model.Result, error) {
@@ -64,18 +106,72 @@ func Run(ctx context.Context, cfg model.Config, paths model.ProjectPaths, printe
 		overrideSet[methodKey(call.FilePath, call.MethodName)] = struct{}{}
 	}
 	methods := extractMethods(sourceFiles, overrideSet)
+	// Partition route methods immediately — they are not searched for code usage.
+	regularMethods := make([]model.MethodDef, 0, len(methods))
+	routeMethodDefs := make([]model.MethodDef, 0)
+	for _, m := range methods {
+		if m.IsRoute {
+			routeMethodDefs = append(routeMethodDefs, m)
+		} else {
+			regularMethods = append(regularMethods, m)
+		}
+	}
 	result.TotalMethods = len(methods)
 	if len(methods) == 0 {
 		return result, nil
 	}
-	printer.Success(fmt.Sprintf("Found %d methods", len(methods)))
+	printer.Success(fmt.Sprintf("Found %d methods (%d routes)", len(methods), len(routeMethodDefs)))
 
 	printer.Step(3, 5, "Building search corpus")
+	// One combined walk over all paths for all extensions.
+	// Source Python files (step 1) are merged in directly — no re-read.
+	// Odoo Python files are derived by filtering the combined result by path prefix.
 	allPaths := append(append([]string(nil), paths.SourcePaths...), paths.OdooPaths...)
-	searchFiles, err := collectFiles(ctx, allPaths, cfg.IncludeTests, map[string]string{".py": "python", ".js": "javascript", ".xml": "xml"}, printer, "Building search corpus")
+
+	// Launch the dino game while the user waits for the corpus to be indexed.
+	var cancelGame context.CancelFunc
+	if printer.Interactive {
+		var gameCtx context.Context
+		gameCtx, cancelGame = context.WithCancel(ctx)
+		go ui.RunDinoGame(gameCtx)
+	}
+
+	odooAndJsXmlFiles, err := collectFiles(ctx, allPaths, cfg.IncludeTests, map[string]string{".py": "python", ".js": "javascript", ".xml": "xml"}, printer, "Building search corpus")
+	if cancelGame != nil {
+		cancelGame() // corpus ready — signal game to show "loading done" and stop
+	}
 	if err != nil {
 		return result, err
 	}
+	// Exclude source Python files (already in sourceFiles) to avoid duplicates,
+	// then partition Odoo Python files for step 5.
+	sourcePathSet := make(map[string]struct{}, len(paths.SourcePaths))
+	for _, p := range paths.SourcePaths {
+		sourcePathSet[filepath.Clean(p)] = struct{}{}
+	}
+	isSourcePath := func(filePath string) bool {
+		for sp := range sourcePathSet {
+			if strings.HasPrefix(filePath, sp+string(filepath.Separator)) || filePath == sp {
+				return true
+			}
+		}
+		return false
+	}
+	var odooPythonFiles []searchFile
+	extraFiles := odooAndJsXmlFiles[:0:0] // reuse backing array type, but start fresh
+	for _, f := range odooAndJsXmlFiles {
+		if f.Language == "python" && isSourcePath(f.Path) {
+			continue // already in sourceFiles
+		}
+		extraFiles = append(extraFiles, f)
+		if f.Language == "python" {
+			odooPythonFiles = append(odooPythonFiles, f)
+		}
+	}
+	searchFiles := make([]searchFile, 0, len(sourceFiles)+len(extraFiles))
+	searchFiles = append(searchFiles, sourceFiles...)
+	searchFiles = append(searchFiles, extraFiles...)
+	sort.Slice(searchFiles, func(i, j int) bool { return searchFiles[i].Path < searchFiles[j].Path })
 	sourceByPath := make(map[string]searchFile, len(sourceFiles))
 	for _, file := range sourceFiles {
 		sourceByPath[file.Path] = file
@@ -84,16 +180,13 @@ func Run(ctx context.Context, cfg model.Config, paths model.ProjectPaths, printe
 
 	printer.Step(4, 5, "Searching for method usage")
 	prefixes := buildDynamicPrefixes(searchFiles)
-	methodResults, err := analyzeMethodUsage(ctx, methods, sourceByPath, searchFiles, prefixes, printer)
+	methodResults, err := analyzeMethodUsage(ctx, regularMethods, sourceByPath, searchFiles, prefixes, printer)
 	if err != nil {
 		return result, err
 	}
 
 	printer.Step(5, 5, "Checking orphaned super() calls")
-	odooPythonFiles, err := collectFiles(ctx, paths.OdooPaths, cfg.IncludeTests, map[string]string{".py": "python"}, printer, "Loading Odoo Python files")
-	if err != nil {
-		return result, err
-	}
+	// Reuse the Odoo Python files already loaded in step 3 — no extra disk walk needed.
 	odooMethodSet := buildMethodSet(odooPythonFiles)
 	orphaned := findOrphanedSuperCalls(superCalls, odooMethodSet)
 	printer.Success(fmt.Sprintf("Found %d orphaned super() calls", len(orphaned)))
@@ -120,9 +213,25 @@ func Run(ctx context.Context, cfg model.Config, paths model.ProjectPaths, printe
 	sortMethodResults(unused)
 	sortSuperCalls(orphaned)
 
+	// Build RouteMethods from the partitioned route defs.
+	routeMethodResults := make([]model.MethodResult, 0, len(routeMethodDefs))
+	for _, m := range routeMethodDefs {
+		routeMethodResults = append(routeMethodResults, model.MethodResult{
+			Name:       m.Name,
+			ClassName:  m.ClassName,
+			FilePath:   m.FilePath,
+			LineNumber: m.LineNumber,
+			IsOverride: m.IsOverride,
+			IsRoute:    true,
+			Routes:     m.Routes,
+		})
+	}
+	sortMethodResults(routeMethodResults)
+
 	result.Methods = methodResults
 	result.UsedMethods = used
 	result.UnusedMethods = unused
+	result.RouteMethods = routeMethodResults
 	result.OrphanedSuperCalls = orphaned
 	return result, nil
 }
@@ -241,6 +350,40 @@ func findSuperCalls(sourceFiles []searchFile) []model.SuperCall {
 	return calls
 }
 
+// leadingSpaces counts the number of leading space/tab characters in line.
+func leadingSpaces(line string) int {
+	n := 0
+	for _, ch := range line {
+		if ch == ' ' || ch == '\t' {
+			n++
+		} else {
+			break
+		}
+	}
+	return n
+}
+
+// isClassLevelDef returns true when the def at lines[defIdx] is a direct
+// class method, not a nested/inner function. It walks backwards to find the
+// first line whose indentation is strictly less than the def's indentation:
+//   - if that line is a class declaration → class method (true)
+//   - if it is another def (or anything else) → inner function (false)
+//   - if no such line exists → top-level function (false)
+func isClassLevelDef(lines []string, defIdx int) bool {
+	defIndent := leadingSpaces(lines[defIdx])
+	for i := defIdx - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		if leadingSpaces(lines[i]) >= defIndent {
+			continue // same or deeper indent: decorators, body of outer block
+		}
+		// First line with strictly less indentation.
+		return classRe.MatchString(lines[i])
+	}
+	return false
+}
+
 func extractMethods(sourceFiles []searchFile, overrideSet map[string]struct{}) []model.MethodDef {
 	methods := make([]model.MethodDef, 0)
 	for _, file := range sourceFiles {
@@ -250,17 +393,24 @@ func extractMethods(sourceFiles []searchFile, overrideSet map[string]struct{}) [
 				continue
 			}
 			methodName := match[1]
-			if shouldSkipMethod(methodName) || hasRouteDecorator(file.Lines, index+1) {
+			if shouldSkipMethod(methodName) || !isClassLevelDef(file.Lines, index) {
 				continue
 			}
+			lineNumber := index + 1
 			_, isOverride := overrideSet[methodKey(file.Path, methodName)]
-			methods = append(methods, model.MethodDef{
+			isRoute := hasRouteDecorator(file.Lines, lineNumber)
+			def := model.MethodDef{
 				Name:       methodName,
-				ClassName:  nearestClassName(file.Lines, index+1),
+				ClassName:  nearestClassName(file.Lines, lineNumber),
 				FilePath:   file.Path,
-				LineNumber: index + 1,
+				LineNumber: lineNumber,
 				IsOverride: isOverride,
-			})
+				IsRoute:    isRoute,
+			}
+			if isRoute {
+				def.Routes = extractRouteURLs(file.Lines, lineNumber)
+			}
+			methods = append(methods, def)
 		}
 	}
 	return methods
@@ -294,11 +444,13 @@ func analyzeMethodUsage(ctx context.Context, methods []model.MethodDef, sourceBy
 				Line:     method.LineNumber,
 			}}
 		} else {
+			// Build regexes once for this method name, then scan all files.
+			patterns := buildMethodPatterns(method.Name)
 			for _, file := range searchFiles {
 				if !strings.Contains(file.Content, method.Name) {
 					continue
 				}
-				if hit, ok := findUsage(method, file); ok {
+				if hit, ok := findUsage(method, file, patterns); ok {
 					result.UsageHits = []model.UsageHit{hit}
 					break
 				}
@@ -323,21 +475,20 @@ func analyzeMethodUsage(ctx context.Context, methods []model.MethodDef, sourceBy
 	return results, nil
 }
 
-func findUsage(method model.MethodDef, file searchFile) (model.UsageHit, bool) {
+func findUsage(method model.MethodDef, file searchFile, patterns methodPatterns) (model.UsageHit, bool) {
 	switch file.Language {
 	case "python":
-		return findPythonUsage(method, file)
+		return findPythonUsage(method, file, patterns.python)
 	case "javascript":
-		return findJavaScriptUsage(method, file)
+		return findJavaScriptUsage(file, patterns.js)
 	case "xml":
-		return findXMLUsage(method, file)
+		return findXMLUsage(file, patterns.xml)
 	default:
 		return model.UsageHit{}, false
 	}
 }
 
-func findPythonUsage(method model.MethodDef, file searchFile) (model.UsageHit, bool) {
-	quotedName := regexp.QuoteMeta(method.Name)
+func findPythonUsage(method model.MethodDef, file searchFile, checks []langPattern) (model.UsageHit, bool) {
 	skipCallable := func(line string, lineNumber int) bool {
 		if file.Path == method.FilePath && lineNumber == method.LineNumber {
 			return true
@@ -345,38 +496,19 @@ func findPythonUsage(method model.MethodDef, file searchFile) (model.UsageHit, b
 		return defRe.MatchString(line)
 	}
 
-	checks := []struct {
-		reason string
-		re     *regexp.Regexp
-		skip   func(string, int) bool
-	}{
-		{reason: "method_call", re: regexp.MustCompile(`\.` + quotedName + `\s*\(`), skip: skipCallable},
-		{reason: "method_assignment", re: regexp.MustCompile(`=.*\.` + quotedName + `\s*($|[^\w(])`), skip: skipCallable},
-		{reason: "direct_function_call", re: regexp.MustCompile(`\b` + quotedName + `\s*\(`), skip: skipCallable},
-		{reason: "string_reference", re: regexp.MustCompile(`(compute|inverse|search|default|onchange|constraint|depends)\s*=\s*['"]_?` + quotedName + `['"]`)},
-		{reason: "decorator_reference", re: regexp.MustCompile(`@api\.(depends|constrains|onchange)\s*\([^)]*['"]_?` + quotedName + `['"]`)},
-		{reason: "search_attribute", re: regexp.MustCompile(`search\s*=\s*['"]` + quotedName + `['"]`)},
-		{reason: "general_string_reference", re: regexp.MustCompile(`['"]_?` + quotedName + `['"]`)},
-		{reason: "default_assignment", re: regexp.MustCompile(`default\s*=\s*` + quotedName + `\b`)},
-	}
-
 	for _, check := range checks {
-		if lineNumber, ok := firstMatchingLine(file.Lines, check.re, check.skip); ok {
+		var skip func(string, int) bool
+		if check.skipDef {
+			skip = skipCallable
+		}
+		if lineNumber, ok := firstMatchingLine(file.Lines, check.re, skip); ok {
 			return model.UsageHit{Language: "python", Reason: check.reason, FilePath: file.Path, Line: lineNumber}, true
 		}
 	}
 	return model.UsageHit{}, false
 }
 
-func findJavaScriptUsage(method model.MethodDef, file searchFile) (model.UsageHit, bool) {
-	quotedName := regexp.QuoteMeta(method.Name)
-	checks := []struct {
-		reason string
-		re     *regexp.Regexp
-	}{
-		{reason: "direct_call", re: regexp.MustCompile(`(?:\.|\b)` + quotedName + `\s*(?:\(|:)`)},
-		{reason: "string_reference", re: regexp.MustCompile(`["']` + quotedName + `["']`)},
-	}
+func findJavaScriptUsage(file searchFile, checks []langPattern) (model.UsageHit, bool) {
 	for _, check := range checks {
 		if lineNumber, ok := firstMatchingLine(file.Lines, check.re, nil); ok {
 			return model.UsageHit{Language: "javascript", Reason: check.reason, FilePath: file.Path, Line: lineNumber}, true
@@ -385,15 +517,7 @@ func findJavaScriptUsage(method model.MethodDef, file searchFile) (model.UsageHi
 	return model.UsageHit{}, false
 }
 
-func findXMLUsage(method model.MethodDef, file searchFile) (model.UsageHit, bool) {
-	quotedName := regexp.QuoteMeta(method.Name)
-	checks := []struct {
-		reason string
-		re     *regexp.Regexp
-	}{
-		{reason: "attribute_reference", re: regexp.MustCompile(`(name|string|context|attrs|invisible|readonly|required|domain)\s*=\s*["'][^"']*\b` + quotedName + `\b`)},
-		{reason: "text_reference", re: regexp.MustCompile(`\b` + quotedName + `\b`)},
-	}
+func findXMLUsage(file searchFile, checks []langPattern) (model.UsageHit, bool) {
 	for _, check := range checks {
 		if lineNumber, ok := firstMatchingLine(file.Lines, check.re, nil); ok {
 			return model.UsageHit{Language: "xml", Reason: check.reason, FilePath: file.Path, Line: lineNumber}, true
@@ -492,6 +616,53 @@ func hasRouteDecorator(lines []string, lineNumber int) bool {
 		}
 	}
 	return false
+}
+
+// extractRouteURLs returns the URL path(s) declared in the @route / @http.route
+// decorator that precedes the def at lineNumber (1-based). It handles single
+// strings, lists of strings, and multi-line decorator spans.
+func extractRouteURLs(lines []string, lineNumber int) []string {
+	// Locate the decorator line (search up to 20 lines back).
+	start := lineNumber - 20
+	if start < 0 {
+		start = 0
+	}
+	decoratorStart := -1
+	for i := lineNumber - 2; i >= start; i-- {
+		if routeDecoratorRe.MatchString(lines[i]) {
+			decoratorStart = i
+			break
+		}
+	}
+	if decoratorStart < 0 {
+		return nil
+	}
+
+	// Collect the full decorator text (walk forward until parens balance).
+	var sb strings.Builder
+	depth := 0
+	for i := decoratorStart; i < len(lines) && i < lineNumber-1; i++ {
+		sb.WriteString(lines[i])
+		for _, ch := range lines[i] {
+			switch ch {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			}
+		}
+		if depth == 0 && i > decoratorStart {
+			break
+		}
+	}
+
+	// Extract all quoted strings that look like URL paths (start with /).
+	matches := routeStringRe.FindAllStringSubmatch(sb.String(), -1)
+	routes := make([]string, 0, len(matches))
+	for _, m := range matches {
+		routes = append(routes, m[1])
+	}
+	return routes
 }
 
 func nearestClassName(lines []string, lineNumber int) string {

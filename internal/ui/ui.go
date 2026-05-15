@@ -7,12 +7,13 @@ import (
 )
 
 const (
-	colorBlue   = "\033[34m"
-	colorCyan   = "\033[36m"
-	colorGreen  = "\033[32m"
-	colorRed    = "\033[31m"
-	colorYellow = "\033[33m"
-	colorReset  = "\033[0m"
+	colorBlue    = "\033[34m"
+	colorCyan    = "\033[36m"
+	colorGreen   = "\033[32m"
+	colorMagenta = "\033[35m"
+	colorRed     = "\033[31m"
+	colorYellow  = "\033[33m"
+	colorReset   = "\033[0m"
 )
 
 type Printer struct {
@@ -108,4 +109,14 @@ func (p *Printer) paint(color string, message string) string {
 		return message
 	}
 	return color + message + colorReset
+}
+
+// RouteColor returns msg wrapped in magenta — used to highlight HTTP route methods.
+func (p *Printer) RouteColor(msg string) string {
+	return p.paint(colorMagenta, msg)
+}
+
+// YellowColor returns msg wrapped in yellow — used for warnings.
+func (p *Printer) YellowColor(msg string) string {
+	return p.paint(colorYellow, msg)
 }

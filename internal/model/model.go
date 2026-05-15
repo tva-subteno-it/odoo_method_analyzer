@@ -15,11 +15,13 @@ type ProjectPaths struct {
 }
 
 type MethodDef struct {
-	Name       string `json:"name"`
-	ClassName  string `json:"class_name"`
-	FilePath   string `json:"file_path"`
-	LineNumber int    `json:"line_number"`
-	IsOverride bool   `json:"is_override"`
+	Name       string   `json:"name"`
+	ClassName  string   `json:"class_name"`
+	FilePath   string   `json:"file_path"`
+	LineNumber int      `json:"line_number"`
+	IsOverride bool     `json:"is_override"`
+	IsRoute    bool     `json:"is_route"`
+	Routes     []string `json:"routes,omitempty"`
 }
 
 type UsageHit struct {
@@ -44,6 +46,8 @@ type MethodResult struct {
 	UsageCount       int        `json:"usage_count"`
 	IsUsed           bool       `json:"is_used"`
 	IsOverride       bool       `json:"is_override"`
+	IsRoute          bool       `json:"is_route"`
+	Routes           []string   `json:"routes,omitempty"`
 	HasOrphanedSuper bool       `json:"has_orphaned_super"`
 	UsageHits        []UsageHit `json:"usage_hits,omitempty"`
 }
@@ -57,6 +61,7 @@ type Result struct {
 	TotalMethods       int            `json:"total_methods"`
 	UsedMethods        []MethodResult `json:"used_methods"`
 	UnusedMethods      []MethodResult `json:"unused_methods"`
+	RouteMethods       []MethodResult `json:"route_methods"`
 	OrphanedSuperCalls []SuperCall    `json:"orphaned_super_calls"`
 	Methods            []MethodResult `json:"methods"`
 }
