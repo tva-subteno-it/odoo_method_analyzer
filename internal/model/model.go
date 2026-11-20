@@ -7,6 +7,7 @@ type Config struct {
 	IncludeTests bool
 	Verbose      bool
 	OutputFile   string
+	OdooVersion  string
 }
 
 type ProjectPaths struct {

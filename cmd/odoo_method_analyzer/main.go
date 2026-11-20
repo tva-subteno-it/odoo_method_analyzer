@@ -31,17 +31,17 @@ func main() {
 	printer.Header()
 	printer.Info("Using current directory as project root: " + cfg.Root)
 
-	paths, err := project.Discover(cfg.Root)
+	paths, err := project.Discover(cfg.Root, cfg.OdooVersion)
 	if err != nil {
 		printer.Error(err.Error())
 		os.Exit(1)
 	}
+	for _, path := range paths.OdooPaths {
+		printer.Info("Odoo path: " + path)
+	}
 	if cfg.Verbose {
 		for _, path := range paths.SourcePaths {
 			printer.Debug("Source path: " + path)
-		}
-		for _, path := range paths.OdooPaths {
-			printer.Debug("Odoo path: " + path)
 		}
 	}
 
@@ -82,6 +82,7 @@ func parseFlags() (model.Config, error) {
 	flag.BoolVar(&verboseLong, "verbose", false, "enable verbose output")
 	flag.StringVar(&outputShort, "o", "", "write detailed JSON output to file")
 	flag.StringVar(&outputLong, "output", "", "write detailed JSON output to file")
+	flag.StringVar(&cfg.OdooVersion, "odoo-version", "", "compare against the Odoo sources of this version, e.g. 200 for ../odoo_200 (default: the version of odoo.conf, then .config.yml)")
 	flag.BoolVar(&helpShort, "h", false, "show help")
 	flag.BoolVar(&helpLong, "help", false, "show help")
 	flag.Usage = func() {
